@@ -3,6 +3,7 @@ import base64
 from datetime import datetime
 import os
 import shutil
+import cv2
 
 import numpy as np
 import socketio
@@ -13,6 +14,7 @@ from flask import Flask
 from io import BytesIO
 
 from keras.models import load_model
+from keras.models import model_from_json
 import h5py
 from keras import __version__ as keras_version
 
@@ -29,6 +31,7 @@ class SimplePIController:
         self.set_point = 0.
         self.error = 0.
         self.integral = 0.
+        self.integral_max = 100
 
     def set_desired(self, desired):
         self.set_point = desired
@@ -40,12 +43,37 @@ class SimplePIController:
         # integral error
         self.integral += self.error
 
-        return self.Kp * self.error + self.Ki * self.integral
+        # Anti-wind up
+        if self.integral > self.integral_max:
+            self.integral = self.integral_max
+
+        # print('I', self.integral)
+
+        PI_control = self.Kp * self.error + self.Ki * self.integral
+
+        #Saturation
+        if PI_control > 0.5:
+            PI_control = 0.5
+
+        # print('PI', PI_control)
+        return PI_control
 
 
 controller = SimplePIController(0.1, 0.002)
-set_speed = 9
+set_speed = 18
 controller.set_desired(set_speed)
+
+
+def process_image(image):
+    """
+    Returns an image after applying several preprocessing functions.
+    :param image: Image represented as a numpy array.
+    """
+    image = image[50:140,:,:]
+    image = cv2.GaussianBlur(image, (3,3), 0)
+    image = cv2.resize(image, (200, 66))
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2YUV)
+    return image
 
 
 @sio.on('telemetry')
@@ -59,14 +87,18 @@ def telemetry(sid, data):
         speed = data["speed"]
         # The current image from the center camera of the car
         imgString = data["image"]
+        # print(imgString)
         image = Image.open(BytesIO(base64.b64decode(imgString)))
         image_array = np.asarray(image)
-        steering_angle = float(model.predict(image_array[None, :, :, :], batch_size=1))
+        img = process_image(image_array)
+        transformed_image_array = img[None, :, :, :]
+        # This model currently assumes that the features of the model are just the image
+        steering_angle = float(model.predict(transformed_image_array, batch_size=1))
 
         throttle = controller.update(float(speed))
-
-        print(steering_angle, throttle)
         send_control(steering_angle, throttle)
+
+        # print(steering_angle, throttle)
 
         # save frame
         if args.image_folder != '':
@@ -120,6 +152,8 @@ if __name__ == '__main__':
               ', but the model was built using ', model_version)
 
     model = load_model(args.model)
+    model.compile("adam", "mse")
+    # model.load_weights(weights_file)
 
     if args.image_folder != '':
         print("Creating image folder at {}".format(args.image_folder))
